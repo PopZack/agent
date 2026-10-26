@@ -1,1 +1,128 @@
-# agent
+# Enterprise Agent · 企业智能Agent助手
+
+从零实现一个 **Agent Harness / Runtime** 的学习项目。目标不是"跑通一个 Demo"，
+而是把每一层为什么这么设计讲清楚、写出来、测出来。
+
+> 硬约束：**只用模拟数据、模拟审批接口，不接任何真实企业系统。**
+
+## 这是什么
+
+模拟企业内部智能助手：能查公司制度、分析业务数据、调用业务工具，
+并执行**有权限限制的多步骤任务**。所有涉及真实修改数据的操作，
+都必须先过权限检查 + 人工确认。
+
+## 目标架构（7 层）
+
+```
+用户交互层      聊天界面 / 会话管理 / 流式响应 / 任务状态
+     │
+Agent Harness   执行循环 / 规划 / 状态机 / 上下文压缩 / 重试 / 权限 / 日志 / 恢复
+     │
+RAG 知识库      文档解析 / Embedding / 检索 / Rerank / 引用
+     │
+工具系统        Function Calling / MCP / SQL 查询 / 业务 API
+     │
+数据层          PostgreSQL / Redis / 向量检索 / 任务状态
+     │
+安全与质量      沙箱 / 权限 / 评测 / Tracing / Token 成本
+     │
+部署与运维      Docker / 自动化测试 / CI-CD / 监控 / 故障恢复
+```
+
+## 当前进度
+
+**阶段 01 · 后端基础与项目骨架** ✅
+
+交付标准（来自项目规格）：*「一个可以接收问题、返回 JSON、记录请求日志的后端服务」*
+
+```
+POST /chat  ──→  RequestContextMiddleware （生成/沿用 request_id，写入 ContextVar）
+                     │
+                     ├─→ ChatRequest        （Pydantic 校验入参）
+                     ├─→ ChatService.answer （业务逻辑；⛔ 阶段 02 在这里换成真模型调用）
+                     └─→ ChatResponse       （拼装对外契约，盖 request_id）
+                     │
+                     └─→ 访问日志（自带 request_id + 耗时） + 响应头 X-Request-ID
+```
+
+## 快速开始
+
+```bash
+# 1. 建虚拟环境并安装（含开发依赖）
+python -m venv .venv
+.venv/Scripts/python -m pip install -e ".[dev]"     # Windows
+# source .venv/bin/activate && pip install -e ".[dev]"   # macOS / Linux
+
+# 2. 配置
+cp .env.example .env
+
+# 3. 启动（Windows 下加 PYTHONIOENCODING 避免中文日志乱码）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python -m uvicorn app.main:app --reload
+```
+
+接口文档 http://127.0.0.1:8000/docs
+
+```bash
+curl -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "X-Request-ID: trace-demo-001" \
+  -d '{"message":"帮我查一下公司的差旅报销制度，并告诉我住宿标准。"}'
+```
+
+```json
+{
+  "request_id": "trace-demo-001",
+  "session_id": null,
+  "answer": "[阶段01 骨架] 已收到你的问题：帮我查一下公司的差旅报销制度，并告诉我住宿标准。",
+  "stage": "01-skeleton",
+  "model": null
+}
+```
+
+## 开发命令
+
+```bash
+.venv/Scripts/python -m pytest          # 跑测试（8 条，覆盖 200/422/400/500 与 request_id 不断链）
+.venv/Scripts/python -m ruff check .    # lint
+.venv/Scripts/python -m ruff format .   # 格式化（已采纳，请勿手工对齐行内注释）
+```
+
+## 目录结构
+
+```
+app/
+├─ main.py              应用入口（create_app 工厂）
+├─ core/                跨层基础设施，被所有人依赖，自己不依赖别人
+│  ├─ config.py         pydantic-settings 配置（启动即校验）
+│  ├─ context.py        request_id 的 ContextVar —— 全链路串联的地基
+│  ├─ logging.py        Filter 补 request_id / Formatter 出文本或 JSON
+│  └─ exceptions.py     与协议无关的业务异常体系
+├─ api/                 对外接口层：只做校验、装配、翻译，不写业务
+│  ├─ middleware.py     request_id 中间件 + 访问日志
+│  ├─ errors.py         异常 → HTTP 的唯一翻译点
+│  ├─ deps.py           依赖装配点
+│  └─ routers/          health / chat
+├─ schemas/             对外契约（请求严、响应稳）
+└─ services/            业务逻辑（不许 import fastapi）
+tests/                  验收测试 —— 每条断言对应一个设计决策
+```
+
+**依赖方向只能向下：** `api → services →（阶段 05 起：runtime/tools/rag/db）`，
+`core` 谁都能用、自己谁也不依赖。
+
+## 学习路线
+
+| 阶段 | 主题 | 状态 |
+|---|---|---|
+| 01 | 后端基础与项目骨架 | ✅ 已完成 |
+| 02 | LLM 应用与 Prompt Engineering | ⬜ |
+| 03 | 数据库与会话记忆 | ⬜ |
+| 04 | RAG 企业知识库 | ⬜ |
+| 05 | Agent 核心执行循环（ReAct / Plan-and-Execute） | ⬜ |
+| 06 | MCP 与业务工具生态 | ⬜ |
+| 07 | Agent Harness 工程化（Skills/Hooks/Subagents/Rules） | ⬜ |
+| 08 | 评测、可观测性与成本优化 | ⬜ |
+| 09 | Docker 与生产部署 | ⬜ |
+| 10 | 综合项目与面试准备 | ⬜ |
+
+每阶段都在上一阶段代码上迭代，不重写 Demo。
