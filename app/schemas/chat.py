@@ -48,3 +48,7 @@ class ChatResponse(BaseModel):
     reason: str | None = Field(default=None, description="模型的判断依据")
     repairs: int = Field(default=0, description="为拿到合法结构化输出额外重问了几次")
     total_tokens: int = Field(default=0, description="本次调用消耗的 token 总量")
+
+    # ── 阶段 02b-2 新增 ──
+    tools_used: list[str] = Field(default_factory=list, description="本次实际调用了哪些工具")
+    tool_rounds: int = Field(default=0, description="工具轮次用掉了几轮")

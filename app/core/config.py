@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # 意图置信度低于这个值就不硬猜，转为向用户澄清（对应 JD 的"质量门槛"）
     intent_confidence_threshold: float = 0.6
 
+    # 工具调用：单次工具必须有超时（它可能是网络调用），
+    # 轮次必须有上限（模型可能反复要工具，形成烧钱循环）
+    tool_timeout_seconds: float = 10.0
+    max_tool_rounds: int = 2
+
 
 @lru_cache
 def get_settings() -> Settings:

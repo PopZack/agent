@@ -51,7 +51,7 @@ def test_chat_returns_structured_intent(app):
     assert body["reason"]
     assert body["repairs"] == 0
     assert body["total_tokens"] > 0  # token 统计从这一阶段起有了
-    assert body["stage"] == "02-intent"
+    assert body["stage"] == "02b-2-tools"
     assert body["model"] == "mock-model"
     assert body["request_id"]
 
@@ -59,20 +59,20 @@ def test_chat_returns_structured_intent(app):
 # ── 3. 意图真的被用来分流了，不是一个装饰性的字段 ──────────────
 def test_intent_changes_the_answer(app):
     chatty = (
-        use_llm(app, intent_client("chitchat", 0.95))
+        use_llm(app, intent_client("chitchat", 0.95, answer="你好，我是企业智能助手，有事请说。"))
         .post("/chat", json={"message": "你好"})
         .json()["answer"]
     )
 
     knowledge = (
-        use_llm(app, intent_client("knowledge_query", 0.95))
+        use_llm(app, intent_client("knowledge_query", 0.95, answer="关于差旅制度：见阶段 04。"))
         .post("/chat", json={"message": "差旅报销标准是多少"})
         .json()["answer"]
     )
 
-    assert "企业智能助手" in chatty  # 闲聊走的是直接回应
-    assert "阶段 04" in knowledge  # 知识查询指向后续阶段
-    assert chatty != knowledge
+    assert "企业智能助手" in chatty  # 闲聊的回答来自回答轮
+    assert "阶段 04" in knowledge  # 知识查询的回答同样来自回答轮，但内容不同
+    assert chatty != knowledge  # 意图不同 → 回答不同，这才是本测试的真正断言
 
 
 # ── 4. 置信度低于门槛 → 转为向用户澄清，而不是硬猜 ────────────

@@ -53,3 +53,57 @@ def build_intent_messages(question: str) -> list[ChatMessage]:
         ChatMessage("system", INTENT_SYSTEM_PROMPT),
         ChatMessage("user", question),
     ]
+
+
+# ── 阶段 02b-2：工具轮次与回答轮次**分开**，各用各的 system prompt ──
+# 理由见 app/services/chat_service.py 顶部：两次调用的约束是相反的，
+# 一个 prompt 很难同时把"严格"和"流畅"两件事做好。
+
+TOOL_AGENT_PROMPT_VERSION = "tool-agent-v1"
+
+TOOL_SYSTEM_PROMPT = """你是企业内部智能工作助手的数据获取阶段。
+
+# 你的唯一任务
+判断用户的问题是否需要查询真实业务数据。
+- 需要 → 调用合适的工具。**绝对不要自己编造任何数字。**
+- 不需要（纯制度解释、闲聊）→ 直接给出回答，不要调用工具。
+
+# 硬规则
+- 一切数值（金额、天数、余额、百分比）必须来自工具返回，不得凭记忆或推测给出。
+- 互相独立的查询可以一次调用多个工具；但不要为了"保险"去调用无关工具。
+- 工具返回失败时，**不要反复重试同一个调用**；根据失败原因改参数、换工具，
+  或者干脆如实说明。
+"""
+
+ANSWER_SYSTEM_PROMPT = """你是企业内部智能工作助手的回答阶段。
+
+# 你的任务
+基于对话中已有的工具返回数据，用中文回答用户的问题。
+
+# 硬规则
+- **不要重新计算数值**：工具返回里已经算好了超支金额、百分比、剩余天数等，
+  直接引用即可。自己再算一遍只会引入前后不一致。
+- 工具返回失败时，如实说明原因并给出用户能采取的下一步，不要假装成功。
+- 现有数据不足以回答时，**明确说"现有数据不足以回答"**，不要用常识补齐。
+- 不要提"工具""字段""JSON"这类实现细节，用业务语言说话。
+"""
+
+
+def build_tool_messages(question: str) -> list[ChatMessage]:
+    """工具轮次的输入。"""
+    return [
+        ChatMessage("system", TOOL_SYSTEM_PROMPT),
+        ChatMessage("user", question),
+    ]
+
+
+def build_answer_messages(tail: list[ChatMessage]) -> list[ChatMessage]:
+    """回答轮次的输入。
+
+    tail 是工具轮次留下的消息尾巴（user + assistant(tool_calls) + tool(...)），
+    **原样保留**。这一点很重要：模型看到的是协议原样的工具调用记录，
+    而不是我们把结果拼成一段自然语言塞进 user 消息里 —— 后者会丢掉
+    "哪个结果对应哪次调用"的配对关系（tool_call_id），
+    工具一多，模型就开始张冠李戴。
+    """
+    return [ChatMessage("system", ANSWER_SYSTEM_PROMPT), *tail]

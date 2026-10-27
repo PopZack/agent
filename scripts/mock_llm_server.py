@@ -36,7 +36,7 @@ import time
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI(title="Mock LLM Server", version="0.1.0")
 
@@ -135,6 +135,97 @@ def _completion(content: str, model: str, prompt_text: str) -> JSONResponse:
     )
 
 
+# ── 假装会调用工具（规则匹配，确定性）───────────────────
+def _choose_tool(user_text: str, full_text: str) -> tuple[str | None, dict | None]:
+    if any(k in user_text for k in ("年假", "余额", "假期", "请假")):
+        match = re.search(r"E\d{4}", full_text, re.I)
+        return "get_leave_balance", {"employee_id": match.group(0).upper() if match else "E1001"}
+    if any(k in user_text for k in ("费用", "预算", "超支", "各部门", "支出")):
+        match = re.search(r"\d{4}-\d{2}", full_text)
+        return "query_department_expense", {"month": match.group(0) if match else "2026-09"}
+    return None, None
+
+
+def _tool_call_response(body: dict, full_text: str, user_text: str, model: str) -> JSONResponse:
+    tool_messages = [m for m in body.get("messages", []) if m.get("role") == "tool"]
+    if tool_messages:
+        last = str(tool_messages[-1].get("content", ""))
+        if "[工具调用失败]" in last:
+            # 上一次调用失败了 —— 模型看到失败原因后修正自己的选择。
+            # 这正是"工具失败 ≠ 请求失败"要演示的场景。
+            name, args = _choose_tool(user_text, full_text)
+            if name:
+                return _calls_response(
+                    model, [(f"call_retry_{name}", name, json.dumps(args, ensure_ascii=False))]
+                )
+        return _completion("（mock）已拿到工具结果。", model, user_text)
+    if "[[BAD_TOOL]]" in full_text:
+        return _calls_response(model, [("call_bad", "query_expense_v2", '{"month":"2026-09"}')])
+    if "[[BAD_ARGS]]" in full_text:
+        return _calls_response(
+            model, [("call_bad_args", "query_department_expense", "{month: 2026-09}")]
+        )
+    name, args = _choose_tool(user_text, full_text)
+    if name is None:
+        return _completion("这个问题不需要查询业务数据。", model, user_text)
+    return _calls_response(model, [(f"call_{name}", name, json.dumps(args, ensure_ascii=False))])
+
+
+def _calls_response(model: str, calls: list[tuple[str, str, str]]) -> JSONResponse:
+    return JSONResponse(
+        {
+            "id": f"chatcmpl-mock-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": cid,
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }
+                            for cid, name, arguments in calls
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42},
+        }
+    )
+
+
+# ── 假装会流式输出 ─────────────────────────────────────
+def _answer_text(body: dict) -> str:
+    tool_contents = [
+        str(m.get("content", "")) for m in body.get("messages", []) if m.get("role") == "tool"
+    ]
+    if tool_contents:
+        return "根据查询结果：" + "；".join(tool_contents)
+    question = _last_user_message(body)
+    if any(k in question for k in ("你好", "您好")):
+        return "你好，我是企业智能助手。可以问我公司制度、业务数据，或让我处理具体事务。"
+    return f"（mock 回答）关于「{question[:40]}」，这是占位回答。"
+
+
+async def _sse_answer(text: str, model: str, full_text: str):
+    if "[[BADFRAME]]" in full_text:
+        # 故意注入一个坏帧：验证客户端会"跳过并计数"而不是整条流崩掉
+        yield "data: {this is not json\n\n"
+    for index in range(0, len(text), 8):
+        piece = text[index : index + 8]
+        chunk = {"choices": [{"delta": {"content": piece}}]}
+        yield "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+        await asyncio.sleep(0.02)
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
@@ -180,6 +271,16 @@ async def chat_completions(request: Request):
             return _completion("好的，我认为这句话是在询问公司制度。", model, user_text)
         encoded = json.dumps(_intent_payload(user_text, marker_text=full_text), ensure_ascii=False)
         return _completion(encoded, model, user_text)
+
+    # ── 流式：stream=true 时吐 SSE ──
+    if body.get("stream"):
+        return StreamingResponse(
+            _sse_answer(_answer_text(body), model, full_text), media_type="text/event-stream"
+        )
+
+    # ── 工具调用模式：请求里带了 tools ──
+    if body.get("tools"):
+        return _tool_call_response(body, full_text, user_text, model)
 
     if "[[BADBODY]]" in user_text:
         # 200 但结构不对：验证客户端会不会把"格式漂移"讲清楚

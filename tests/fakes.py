@@ -13,6 +13,9 @@ from app.core.config import Settings
 from app.llm.client import LLMClient
 from app.services.chat_service import ChatService
 from app.services.intent_service import IntentService
+from app.services.tool_service import ToolRunner
+from app.tools.business import build_default_tools
+from app.tools.registry import ToolRegistry
 
 
 def make_settings(**overrides) -> Settings:
@@ -98,6 +101,34 @@ def scripted_client(
     return make_client(handler, **overrides)
 
 
+def tool_call_json(name: str, arguments: dict | str) -> str:
+    """构造一个 tool_calls 响应体（给 scripted_client 用）。"""
+    args = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+    return json.dumps(
+        {
+            "model": "mock-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": f"call_{name}",
+                                "type": "function",
+                                "function": {"name": name, "arguments": args},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42},
+        }
+    )
+
+
 def intent_json(
     intent: str = "knowledge_query",
     confidence: float = 0.91,
@@ -111,12 +142,37 @@ def intent_json(
 
 
 def intent_client(
-    intent: str = "knowledge_query", confidence: float = 0.91, **overrides
+    intent: str = "knowledge_query",
+    confidence: float = 0.91,
+    *,
+    answer: str = "（mock 回答）这是回答轮的输出。",
+    **overrides,
 ) -> LLMClient:
-    return text_client(intent_json(intent, confidence), **overrides)
+    """按调用类型分流的假模型。
+
+    真实链路里，意图轮带 response_format=json_object，回答轮不带。
+    假件必须按这个特征分流 —— 否则回答轮会把意图 JSON 当回答吐回来
+    （这正是本函数第一版踩过的坑：闲聊的回答变成了一段原始 JSON）。
+
+    分流依据是**请求自身的特征**，不是调用顺序：顺序会随实现微调，
+    特征是协议层面的、稳定的。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if (payload.get("response_format") or {}).get("type") == "json_object":
+            return httpx.Response(200, json=ok_body(intent_json(intent, confidence)))
+        return httpx.Response(200, json=ok_body(answer))
+
+    return make_client(handler, **overrides)
 
 
-def chat_service_with(llm: LLMClient, settings: Settings | None = None) -> ChatService:
+def chat_service_with(
+    llm: LLMClient,
+    settings: Settings | None = None,
+    *,
+    tools: list | None = None,
+) -> ChatService:
     """组装一条"只有网络是假的、其余代码全真"的链路。
 
     ⚠️ 这里为什么不直接 override get_llm_client —— 这是个真实的坑：
@@ -133,4 +189,11 @@ def chat_service_with(llm: LLMClient, settings: Settings | None = None) -> ChatS
     覆盖一个点，链路其余部分保持真实，是性价比最高的做法。
     """
     settings = settings or make_settings()
-    return ChatService(IntentService(llm, settings), settings)
+    registry = ToolRegistry(tools if tools is not None else build_default_tools())
+    return ChatService(
+        IntentService(llm, settings),
+        llm,
+        registry,
+        ToolRunner(registry, settings),
+        settings,
+    )

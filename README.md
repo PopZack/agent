@@ -80,7 +80,23 @@ POST /chat
   └─ 置信度 < 阈值(0.6) → 转为向用户澄清，而不是硬猜
 ```
 
-02b-2 待做：Function Calling + 流式 SSE。
+### 阶段 02b-2 · Function Calling + 流式 SSE ✅
+
+交付标准：*模型能选择并调用工具拿到真实数据；回答能以 SSE 流式吐出*
+
+```
+POST /chat            非流式：意图 → 工具轮（最多 N 轮）→ 回答轮
+POST /chat/stream     流式：  同一条链路，回答轮改为 SSE 逐段吐出
+
+工具执行器四道关（模型输出是不可信输入）：
+  1 白名单   工具名不存在 → 把可用清单回传，模型下一轮才可能选对
+  2 解析     arguments 不是合法 JSON → 原文截断回传
+  3 校验     Pydantic 校验参数 → 错误里带"实际给的是什么"
+  4 超时     asyncio.timeout 包住执行 → 挂死的工具不能挂死请求
+任何一关失败都返回 ToolResult(ok=False) 讲给模型听 —— 工具失败 ≠ 请求失败。
+```
+
+**阶段 02 完结。** 下一站：阶段 03 数据库与会话记忆。
 
 ## 快速开始
 
@@ -119,7 +135,7 @@ curl -X POST http://127.0.0.1:8000/chat \
 ## 开发命令
 
 ```bash
-.venv/Scripts/python -m pytest          # 31 条测试
+.venv/Scripts/python -m pytest          # 52 条测试
 .venv/Scripts/python -m ruff check .    # lint
 .venv/Scripts/python -m ruff format .   # 格式化（已采纳，请勿手工对齐行内注释）
 
@@ -147,11 +163,16 @@ app/
 │  ├─ chat.py           /chat 的出入参
 │  └─ intent.py         意图契约：枚举类别 + 置信度 + 宽进严出的归一化
 ├─ llm/                 模型接入层：原生 httpx，超时 / 重试 / 错误映射
-│  ├─ client.py         chat() / chat_structured() + 退避策略 + 协议解析
+│  ├─ client.py         chat / chat_structured / chat_stream + SSE 解析
 │  └─ prompts.py        提示词集中管理（带版本号，便于回归对比）
+├─ tools/               工具系统
+│  ├─ base.py           Tool 基类：schema 从 Pydantic 自动生成（剥 title 省 token）
+│  ├─ registry.py       注册表：重名启动即炸 + 按意图的白名单
+│  └─ business.py       模拟业务工具（部门费用 / 年假余额）
 └─ services/            业务逻辑（不许 import fastapi）
-   ├─ chat_service.py   意图分流 + 质量门槛
-   └─ intent_service.py 意图识别（结构化输出）
+   ├─ chat_service.py   意图分流 → 工具轮 → 回答轮（含流式）
+   ├─ intent_service.py 意图识别（结构化输出）
+   └─ tool_service.py   执行器四道关
 tests/                  验收测试 + fakes（假 transport / 假模型）
 scripts/                模拟模型服务 + 实跑演示（不属于 app 包，不参与打包）
 ```
@@ -164,7 +185,7 @@ scripts/                模拟模型服务 + 实跑演示（不属于 app 包，
 | 阶段 | 主题 | 状态 |
 |---|---|---|
 | 01 | 后端基础与项目骨架 | ✅ 已完成 |
-| 02 | LLM 应用与 Prompt Engineering | 🔄 02a ✅ / 02b-1 ✅ / 02b-2 待做 |
+| 02 | LLM 应用与 Prompt Engineering | ✅ 02a / 02b-1 / 02b-2 |
 | 03 | 数据库与会话记忆 | ⬜ |
 | 04 | RAG 企业知识库 | ⬜ |
 | 05 | Agent 核心执行循环（ReAct / Plan-and-Execute） | ⬜ |

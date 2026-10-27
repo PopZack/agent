@@ -17,8 +17,8 @@ import json
 import logging
 import random
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass, field
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -36,20 +36,54 @@ RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 @dataclass(slots=True)
 class ChatMessage:
-    """role 只有三种：system / user / assistant。
+    """role 有四种：system / user / assistant / tool。
 
     这个层级顺序不是随便定的（对应 JD 里"理解 System / Developer / User 的优先级"）：
     system 是"你是谁、守什么规矩"，优先级最高、最稳定；
     user 是"这次要干什么"，每次都变。
     阶段 07 做 Rules 时，规则会落到 system 层，而用户输入永远进不了 system 层 ——
     这是防提示词注入的第一道墙。
+
+    tool 是阶段 02b-2 新增的角色，专门用来把**工具执行结果**回传给模型。
+    它带 tool_call_id 做配对，模型据此知道"这是我刚才要的那次调用"。
     """
 
     role: str
     content: str
+    # 协议里"角色专属"的字段：assistant 请求调工具时带 tool_calls，
+    # tool 回传结果时带 tool_call_id。**只有用到的角色才该带上它们。**
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {"role": self.role, "content": self.content}
+    def to_dict(self) -> dict:
+        payload: dict = {"role": self.role, "content": self.content}
+        if self.tool_calls:
+            payload["tool_calls"] = self.tool_calls
+        if self.tool_call_id:
+            payload["tool_call_id"] = self.tool_call_id
+        return payload
+
+
+@dataclass(slots=True)
+class ToolCall:
+    """模型请求的一次工具调用。
+
+    arguments 是**字符串形式的 JSON** —— 这是协议规定的形状，不是图省事。
+    这里刻意**不解析**它：模型生成的东西属于"不可信输入"，
+    解析、校验、白名单检查都该在执行器里做，让那条边界清清楚楚。
+    """
+
+    id: str
+    name: str
+    arguments: str
+
+    def to_history(self) -> dict:
+        """还原成能塞回对话历史（assistant 消息）的原始形状。"""
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
 
 
 @dataclass(slots=True)
@@ -61,6 +95,13 @@ class LLMResponse:
     finish_reason: str
     latency_ms: float
     attempts: int  # 实际发了几次请求；>1 说明发生过重试
+
+    # 请求调工具时 content 往往是空的 —— 内容在 tool_calls 里
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return bool(self.tool_calls)
 
     @property
     def total_tokens(self) -> int:
@@ -126,6 +167,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float | None = None,
         response_format: dict | None = None,
+        tools: list[dict] | None = None,
     ) -> LLMResponse:
         if not self._settings.llm_base_url:
             # 配置缺失是"我们自己的问题"，但要如实、可操作地告诉调用方
@@ -143,6 +185,11 @@ class LLMClient:
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        if tools:
+            # 注意：不传工具时**不要**塞一个空数组进去。
+            # 有些厂商会把"存在 tools 字段"理解成"必须调用工具"，
+            # 于是模型硬要调一个不存在的工具，报出一堆莫名其妙的错。
+            payload["tools"] = tools
 
         started = time.perf_counter()
         max_retries = self._settings.llm_max_retries
@@ -205,6 +252,71 @@ class LLMClient:
 
         # 循环必然在上面 return 或 raise，这里只是给类型检查器一个兜底
         raise UpstreamError("重试次数耗尽", details={"attempts": max_retries})
+
+    # ── 流式输出 ────────────────────────────────────────
+    async def chat_stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+    ) -> AsyncIterator[str]:
+        """流式调用：模型吐一点，我们 yield 一点。
+
+        ⚠️ 两个**结构性限制**，不是实现偷懒：
+
+        1. **流式不能重试。** 一旦开始往客户端吐字，重发就等于把已发出去的内容
+           作废重来（客户端会看到重复）。所以重试只可能发生在"首字节之前"，
+           这里干脆不重试 —— 出错就把错误当成一个事件发给客户端。
+        2. **流式不能做结构化修复。** 修复的前提是"拿到完整输出再校验"，
+           而流式下你已经把半截内容吐出去了，"回灌重问"在语义上不成立。
+
+        所以两条路要分开用：需要重试和校验走 chat_structured()，
+        需要低首字延迟走这里。真实产品里常见的组合是
+        **意图识别用结构化、最终回答用流式** —— 本项目也是这么设计的。
+        """
+        if not self._settings.llm_base_url:
+            raise UpstreamError(
+                "未配置 LLM_BASE_URL",
+                details={"hint": "复制 .env.example 为 .env，填入模型服务地址"},
+            )
+
+        payload: dict = {
+            "model": model or self._settings.llm_model,
+            "messages": [m.to_dict() for m in messages],
+            "temperature": (
+                temperature if temperature is not None else self._settings.llm_temperature
+            ),
+            "stream": True,
+        }
+
+        skipped = 0
+        async with self._get_client().stream("POST", "/chat/completions", json=payload) as resp:
+            if resp.status_code != 200:
+                body = (await resp.aread()).decode("utf-8", "replace")[:200]
+                raise UpstreamError(
+                    f"模型服务返回 {resp.status_code}",
+                    details={"status": resp.status_code, "body": body},
+                )
+            async for line in resp.aiter_lines():
+                # 空行是 SSE 的**帧分隔符**、": ping" 是心跳 —— 都是协议的一部分，
+                # 不算坏帧。只有"长得像 data: 却解析不出内容"的行才是。
+                if not line or line.startswith(":"):
+                    continue
+                delta = _sse_delta(line)
+                if delta is None:
+                    skipped += 1
+                    continue
+                if delta == _SSE_DONE:
+                    break
+                yield delta
+
+        if skipped:
+            # 坏帧要计数、要被看见，否则"流里少了几句"这种问题永远查不出来
+            logger.warning(
+                "stream_frames_skipped",
+                extra={"event": "stream_frames_skipped", "skipped_frames": skipped},
+            )
 
     # ── 结构化输出 ──────────────────────────────────────
     async def chat_structured(
@@ -347,13 +459,25 @@ class LLMClient:
         try:
             data = resp.json()
             choice = data["choices"][0]
-            content = choice["message"]["content"] or ""
+            message = choice["message"]
+            # content 可能是 null：请求调工具时它就是空的。
+            # 这不是"格式错误"，是协议允许的正常情况。
+            content = message.get("content") or ""
             usage = data.get("usage") or {}
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise UpstreamError(
                 "模型响应格式不符合 OpenAI 兼容协议（缺 choices[0].message.content）",
                 details={"body": resp.text[:200]},
             ) from exc
+
+        tool_calls = [
+            ToolCall(
+                id=call.get("id", ""),
+                name=(call.get("function") or {}).get("name", ""),
+                arguments=(call.get("function") or {}).get("arguments", "") or "",
+            )
+            for call in (message.get("tool_calls") or [])
+        ]
 
         return LLMResponse(
             content=content,
@@ -363,7 +487,41 @@ class LLMClient:
             finish_reason=choice.get("finish_reason", ""),
             latency_ms=round((time.perf_counter() - started) * 1000, 1),
             attempts=attempt,
+            tool_calls=tool_calls,
         )
+
+
+# ── 流式输出的辅助（模块级）──────────────────────────────
+_SSE_DONE = "[DONE]"
+
+
+def _sse_delta(line: str) -> str | None:
+    """把一行 SSE 解析成文本增量；返回 None 表示"这一行没有内容，跳过"。
+
+    帧格式是 `data: {...}`，帧与帧之间用空行分隔，终止哨兵是 `data: [DONE]`。
+
+    三种"不是错误但也不是内容"的情况，都要能跳过去而不是崩掉：
+      · 空行 / 注释行（有些服务端会发 `: ping` 心跳）
+      · **半截 JSON** —— 网络分片可能把一帧切开，aiter_lines 只保证"行"边界，
+        不保证"帧"边界
+      · 合法但没有内容的帧（比如只带 role、或只带 usage 的那种）
+
+    让一个坏帧毁掉整条流，是流式实现里最常见的错误。
+    """
+    if not line or not line.startswith("data:"):
+        return None
+    data = line[len("data:") :].strip()
+    if not data:
+        return None
+    if data == _SSE_DONE:
+        return _SSE_DONE
+    try:
+        chunk = json.loads(data)
+        delta = chunk["choices"][0].get("delta") or {}
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+    content = delta.get("content")
+    return content if content else None
 
 
 # ── 结构化输出的辅助函数（模块级：它们不依赖任何实例状态，纯输入输出）──

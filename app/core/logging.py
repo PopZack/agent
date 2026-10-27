@@ -39,6 +39,10 @@ STRUCTURED_KEYS = (
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
+    "tool_call_id",
+    "tool_ok",
+    "round",
+    "skipped_frames",
 )
 
 
