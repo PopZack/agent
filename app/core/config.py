@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     tool_timeout_seconds: float = 10.0
     max_tool_rounds: int = 2
 
+    # ── 数据库（阶段 03）──
+    # asyncpg 驱动；测试和本地默认都指向 docker compose 起的库
+    database_url: str = "postgresql+asyncpg://agent:agent@127.0.0.1:5432/agent"
+    database_echo: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

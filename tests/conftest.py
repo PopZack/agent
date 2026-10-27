@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -39,3 +41,62 @@ def app():
 @pytest.fixture
 def client(app):
     return TestClient(app)
+
+
+# ── 阶段 03a：真 PostgreSQL 测试夹具 ──────────────────────
+# 放在 conftest 而不是某个测试文件里：pytest 只把 conftest 的夹具
+# 暴露给全部测试。放在 test_db.py 里的话，test_repository.py 就找不到它。
+
+TEST_DB_URL = os.environ.get(
+    "AGENT_TEST_DATABASE_URL",
+    "postgresql+asyncpg://agent:agent@127.0.0.1:5432/agent_test",
+)
+
+
+async def _pg_available(url: str) -> bool:
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    try:
+        engine = create_async_engine(url)
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        await engine.dispose()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="session")
+def pg_ready() -> str:
+    """确认测试库可用，返回 URL；不可用则整组 skip（而不是 fail）。"""
+    import asyncio
+
+    if not asyncio.run(_pg_available(TEST_DB_URL)):
+        pytest.skip(
+            f"测试库不可用（{TEST_DB_URL}）—— 需要先 docker compose up -d 并建 agent_test 库"
+        )
+    return TEST_DB_URL
+
+
+@pytest.fixture
+async def db(pg_ready):
+    """每个测试一张干净的表：建表 → 测试 → 删表。
+
+    不删数据、直接删表：测试之间零残留，也不用小心翼翼清每张表。
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.db.models import Base
+
+    engine = create_async_engine(pg_ready, pool_pre_ping=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with factory() as session:
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()

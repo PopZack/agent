@@ -40,6 +40,14 @@ class InvalidRequestError(AppError):
     message = "请求参数不合法"
 
 
+class UnauthenticatedError(AppError):
+    """带了 session_id（要写入会话）却没有身份标识。"""
+
+    code = "unauthenticated"
+    status_code = 401
+    message = "缺少身份标识"
+
+
 class NotFoundError(AppError):
     code = "not_found"
     status_code = 404

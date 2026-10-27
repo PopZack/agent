@@ -6,6 +6,8 @@
 两个目标不同源，硬塞进一个类，改请求校验就容易连带破坏响应契约。
 """
 
+import uuid
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -26,10 +28,9 @@ class ChatRequest(BaseModel):
         max_length=4000,
         description="用户问题原文",
     )
-    session_id: str | None = Field(
+    session_id: uuid.UUID | None = Field(
         default=None,
-        max_length=64,
-        description="会话 ID；阶段 03 接入数据库后由服务端下发，现在允许客户端自带",
+        description="会话 ID（POST /sessions 创建后获得）；不传则为无会话模式，不落库",
     )
 
 

@@ -96,7 +96,31 @@ POST /chat/stream     流式：  同一条链路，回答轮改为 SSE 逐段吐
 任何一关失败都返回 ToolResult(ok=False) 讲给模型听 —— 工具失败 ≠ 请求失败。
 ```
 
-**阶段 02 完结。** 下一站：阶段 03 数据库与会话记忆。
+**阶段 02 完结。**
+
+### 阶段 03a · 持久化地基 🔄
+
+交付标准（阶段 03 全部完成时）：*支持多用户、多会话，能保存任务状态、对话历史和操作记录*
+
+```
+docker compose up -d                  # PostgreSQL 16（带 healthcheck）
+python scripts/init_db.py             # 建表
+
+users ──< chat_sessions ──< chat_messages
+  UUID 主键（不泄露规模） · timestamptz（带时区） · 软删除（deleted_at）
+  JSONB 存工具轨迹 · (session_id, created_at) 复合索引
+
+POST /sessions            新建会话
+GET  /sessions            我的会话列表（带消息数）
+GET  /sessions/{id}/messages   会话消息（倒序取最近 N 条、正序返回）
+PATCH /sessions/{id}      重命名
+DELETE /sessions/{id}     软删除
+POST /chat                传 session_id 时自动落库（user+assistant 两条）
+                          不传则保持无会话模式，行为与阶段 01/02 一致
+身份：X-User-Name 请求头（学习项目临时方案，接口形状按有鉴权设计）
+```
+
+03b 待做：记忆进上下文（多轮指代消解）、Redis 缓存、记忆生命周期。
 
 ## 快速开始
 
@@ -135,7 +159,7 @@ curl -X POST http://127.0.0.1:8000/chat \
 ## 开发命令
 
 ```bash
-.venv/Scripts/python -m pytest          # 52 条测试
+.venv/Scripts/python -m pytest          # 52 条 + 7 条仓储测试（需 PG，连不上自动 skip）
 .venv/Scripts/python -m ruff check .    # lint
 .venv/Scripts/python -m ruff format .   # 格式化（已采纳，请勿手工对齐行内注释）
 
@@ -158,13 +182,17 @@ app/
 │  ├─ middleware.py     request_id 中间件 + 访问日志
 │  ├─ errors.py         异常 → HTTP 的唯一翻译点
 │  ├─ deps.py           依赖装配点
-│  └─ routers/          health / chat
+│  └─ routers/          health / chat / sessions
 ├─ schemas/             对外契约（请求严、响应稳）
 │  ├─ chat.py           /chat 的出入参
 │  └─ intent.py         意图契约：枚举类别 + 置信度 + 宽进严出的归一化
 ├─ llm/                 模型接入层：原生 httpx，超时 / 重试 / 错误映射
 │  ├─ client.py         chat / chat_structured / chat_stream + SSE 解析
 │  └─ prompts.py        提示词集中管理（带版本号，便于回归对比）
+├─ db/                  数据层（阶段 03a）
+│  ├─ models.py          三张表：users / chat_sessions / chat_messages
+│  ├─ session.py         引擎与请求级会话（事务边界在装配层统一管理）
+│  └─ repository.py      仓储层：多租户隔离写在查询里，不靠调用方自觉
 ├─ tools/               工具系统
 │  ├─ base.py           Tool 基类：schema 从 Pydantic 自动生成（剥 title 省 token）
 │  ├─ registry.py       注册表：重名启动即炸 + 按意图的白名单
@@ -186,7 +214,7 @@ scripts/                模拟模型服务 + 实跑演示（不属于 app 包，
 |---|---|---|
 | 01 | 后端基础与项目骨架 | ✅ 已完成 |
 | 02 | LLM 应用与 Prompt Engineering | ✅ 02a / 02b-1 / 02b-2 |
-| 03 | 数据库与会话记忆 | ⬜ |
+| 03 | 数据库与会话记忆 | 🔄 03a 已完成（待真库验证） / 03b 待做 |
 | 04 | RAG 企业知识库 | ⬜ |
 | 05 | Agent 核心执行循环（ReAct / Plan-and-Execute） | ⬜ |
 | 06 | MCP 与业务工具生态 | ⬜ |

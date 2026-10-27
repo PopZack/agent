@@ -17,9 +17,10 @@ from fastapi import FastAPI
 from app.api.deps import close_llm_client
 from app.api.errors import register_exception_handlers
 from app.api.middleware import RequestContextMiddleware
-from app.api.routers import chat, health
+from app.api.routers import chat, health, sessions
 from app.core.config import get_settings
 from app.core.logging import setup_logging
+from app.db.session import dispose_engine
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("app_started", extra={"event": "app_started"})
     yield
     await close_llm_client()
+    await dispose_engine()  # 连接池也要关，否则容器退出时挂起
     logger.info("app_stopped", extra={"event": "app_stopped"})
 
 
@@ -64,6 +66,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(chat.router)
+    app.include_router(sessions.router)
 
     return app
 

@@ -11,15 +11,20 @@
 
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_chat_service
+from app.api.routers.sessions import get_optional_user_id
 from app.core.context import request_id_var
-from app.core.exceptions import AppError
+from app.core.exceptions import AppError, NotFoundError, UnauthenticatedError
+from app.db.repository import ChatRepository
+from app.db.session import get_db_session
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.chat_service import ChatService
 
@@ -28,12 +33,55 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
 
 
+async def _persist_turn(repo: ChatRepository, payload: ChatRequest, user_id, result) -> None:
+    """把一轮对话落库：user 消息 + assistant 消息。
+
+    落库时机：模型调用**成功之后**。失败时不写半截 ——
+    user 消息也不落，让失败的轮次整体不存在（用户重发就是完整的一轮）。
+    备选方案是"先落 user 再落 assistant"，但那样失败后历史里会留着
+    一条没有回答的问题，阶段 03b 回灌历史时模型会看到"问了没人答"。
+
+    首条消息会把"新会话"标题换成问题摘要 —— 列表页要能认出对话。
+    """
+    session = await repo.get_session(payload.session_id, user_id)
+    if session is None:
+        # 会话不存在或不属于该用户 → 404。
+        # 不静默新建：客户端传错 id 时静默新建，等于把 bug 藏进数据里。
+        raise NotFoundError("会话不存在")
+    await repo.add_message(session.id, role="user", content=payload.message)
+    await repo.add_message(
+        session.id,
+        role="assistant",
+        content=result.answer,
+        intent=result.intent.value if result.intent else None,
+        confidence=result.confidence,
+        total_tokens=result.total_tokens,
+        meta={
+            "request_id": request_id_var.get(),
+            "tools_used": result.tools_used,
+            "tool_rounds": result.tool_rounds,
+            "repairs": result.repairs,
+        },
+    )
+    await repo.set_session_title_if_default(session.id, payload.message)
+
+
 @router.post("/chat", response_model=ChatResponse, summary="一问一答")
 async def chat(
     payload: ChatRequest,
     service: Annotated[ChatService, Depends(get_chat_service)],
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    user_id: Annotated[uuid.UUID | None, Depends(get_optional_user_id)],
 ) -> ChatResponse:
     result = await service.answer(payload)
+    # 无会话模式（不传 session_id）：不落库，行为与阶段 01/02 完全一致。
+    # 有会话：模型成功后才落库；失败时 get_db_session 的 rollback
+    # 让这轮整体不存在（不留"问了没人答"的半截历史）。
+    if payload.session_id is not None:
+        if user_id is None:
+            # 要写入会话却没有身份 —— 401 而不是静默丢弃
+            raise UnauthenticatedError()
+        await _persist_turn(ChatRepository(db), payload, user_id, result)
 
     # request_id 是"请求上下文"，由 api 层盖章，业务层不碰它。
     # 注意 .value：Intent 是 StrEnum，显式取 .value 最省心，不依赖枚举的格式化行为。
