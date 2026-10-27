@@ -31,7 +31,7 @@ RAG 知识库      文档解析 / Embedding / 检索 / Rerank / 引用
 
 ## 当前进度
 
-**阶段 01 · 后端基础与项目骨架** ✅
+### 阶段 01 · 后端基础与项目骨架 ✅
 
 交付标准（来自项目规格）：*「一个可以接收问题、返回 JSON、记录请求日志的后端服务」*
 
@@ -39,11 +39,29 @@ RAG 知识库      文档解析 / Embedding / 检索 / Rerank / 引用
 POST /chat  ──→  RequestContextMiddleware （生成/沿用 request_id，写入 ContextVar）
                      │
                      ├─→ ChatRequest        （Pydantic 校验入参）
-                     ├─→ ChatService.answer （业务逻辑；⛔ 阶段 02 在这里换成真模型调用）
+                     ├─→ ChatService.answer （业务逻辑）
                      └─→ ChatResponse       （拼装对外契约，盖 request_id）
                      │
                      └─→ 访问日志（自带 request_id + 耗时） + 响应头 X-Request-ID
 ```
+
+### 阶段 02a · 模型接入层 ✅
+
+交付标准：*能发出模型调用、扛住限流与超时、并把上游故障讲清楚的一层*
+
+```
+LLMClient.chat()
+   ├─ 发请求   POST {LLM_BASE_URL}/chat/completions   （原生 httpx，不用 SDK）
+   ├─ 超时     connect 与 read 分开设上限
+   ├─ 重试     429 / 5xx / 超时 → 指数退避 + 抖动，优先听 Retry-After
+   │           401 / 403 / 404 → 一次就放弃（重试没意义，只是白烧钱）
+   └─ 解析     choices[0].message.content + usage；上游格式漂移要说清坏在哪
+```
+
+配套的 `scripts/mock_llm_server.py` 是一个模拟模型服务，能按指令返回 429 / 401 /
+畸形响应 —— 重试、超时这类机制**不在真跑一遍的情况下无法验证**。
+
+02b 待做：意图识别（结构化输出）+ Function Calling + 流式 SSE。
 
 ## 快速开始
 
@@ -82,9 +100,13 @@ curl -X POST http://127.0.0.1:8000/chat \
 ## 开发命令
 
 ```bash
-.venv/Scripts/python -m pytest          # 跑测试（8 条，覆盖 200/422/400/500 与 request_id 不断链）
+.venv/Scripts/python -m pytest          # 17 条测试
 .venv/Scripts/python -m ruff check .    # lint
 .venv/Scripts/python -m ruff format .   # 格式化（已采纳，请勿手工对齐行内注释）
+
+# 模拟模型服务 + 实跑演示（学习用，不接真实模型）
+.venv/Scripts/python scripts/mock_llm_server.py    # 终端 1：默认监听 127.0.0.1:8200
+.venv/Scripts/python scripts/demo_llm_layer.py     # 终端 2：实跑正常/限流/鉴权/格式漂移
 ```
 
 ## 目录结构
@@ -103,11 +125,14 @@ app/
 │  ├─ deps.py           依赖装配点
 │  └─ routers/          health / chat
 ├─ schemas/             对外契约（请求严、响应稳）
+├─ llm/                 模型接入层：原生 httpx，超时 / 重试 / 错误映射
+│  └─ client.py         chat() + 退避策略 + OpenAI 兼容协议解析
 └─ services/            业务逻辑（不许 import fastapi）
 tests/                  验收测试 —— 每条断言对应一个设计决策
+scripts/                模拟模型服务 + 实跑演示（不属于 app 包，不参与打包）
 ```
 
-**依赖方向只能向下：** `api → services →（阶段 05 起：runtime/tools/rag/db）`，
+**依赖方向只能向下：** `api → services → llm →（阶段 05 起：runtime/tools/rag/db）`，
 `core` 谁都能用、自己谁也不依赖。
 
 ## 学习路线
@@ -115,7 +140,7 @@ tests/                  验收测试 —— 每条断言对应一个设计决策
 | 阶段 | 主题 | 状态 |
 |---|---|---|
 | 01 | 后端基础与项目骨架 | ✅ 已完成 |
-| 02 | LLM 应用与 Prompt Engineering | ⬜ |
+| 02 | LLM 应用与 Prompt Engineering | 🔄 02a 已完成，02b 待做 |
 | 03 | 数据库与会话记忆 | ⬜ |
 | 04 | RAG 企业知识库 | ⬜ |
 | 05 | Agent 核心执行循环（ReAct / Plan-and-Execute） | ⬜ |

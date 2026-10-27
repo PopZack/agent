@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
+    llm_temperature: float = 0.0
+
+    # 超时与重试：模型 API 不是本地函数调用，超时和 429 是常态不是异常
+    llm_timeout_seconds: float = 30.0
+    llm_max_retries: int = 3
+    llm_retry_base_seconds: float = 0.5
+    llm_retry_max_seconds: float = 8.0
 
 
 @lru_cache

@@ -29,6 +29,10 @@ STRUCTURED_KEYS = (
     "session_id",
     "task_id",
     "tool_name",
+    "model",
+    "attempt",
+    "delay_ms",
+    "finish_reason",
 )
 
 

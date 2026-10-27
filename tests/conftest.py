@@ -6,6 +6,17 @@ from app.core.config import get_settings
 
 
 @pytest.fixture
+def anyio_backend():
+    """给异步测试指定后端。
+
+    anyio 的 pytest 插件默认要**同时**跑 asyncio 和 trio 两套后端，
+    而项目里没有（也不需要）trio，不指定就会以 'trio' 后端报错。
+    这跟"用了哪个框架"无关，纯粹是插件默认值的问题。
+    """
+    return "asyncio"
+
+
+@pytest.fixture
 def app():
     """每个测试拿一个全新的 app。
 
