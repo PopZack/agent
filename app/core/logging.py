@@ -33,6 +33,12 @@ STRUCTURED_KEYS = (
     "attempt",
     "delay_ms",
     "finish_reason",
+    "intent",
+    "confidence",
+    "repairs",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
 )
 
 

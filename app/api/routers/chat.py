@@ -36,4 +36,12 @@ async def chat(
         answer=result.answer,
         stage=result.stage,
         model=result.model,
+        # 注意 .value：Intent 是 str 混合枚举，直接丢进去在 Python 3.11+ 上
+        # str(Intent.X) 会得到 "Intent.X"，但格式化和 JSON 序列化又走另一套规则 ——
+        # 这种微妙的差异不值得依赖，显式取 .value 最省心。
+        intent=result.intent.value if result.intent else None,
+        confidence=result.confidence,
+        reason=result.reason,
+        repairs=result.repairs,
+        total_tokens=result.total_tokens,
     )

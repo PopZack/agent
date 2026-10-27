@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import re
 import time
 
@@ -60,12 +61,92 @@ def _pick_reply(user_text: str) -> str:
     return f"[mock-llm] 已收到：{user_text[:80]}"
 
 
+# ── 假装会做意图分类（纯关键词规则，确定性输出）───────────────
+# 它不聪明，但足够让整条链路真跑起来；真正"聪明"的部分由真模型提供，
+# 这里只负责让链路的形状可验证。
+# 顺序即优先级，这一点很实际："根据公司的请假**制度**，帮我生成请假申请"
+# 同时命中"制度"（知识查询）和"请假"（要动作）。要动作更"重"，
+# 所以 task_execution 必须排在 knowledge_query 前面。
+_INTENT_RULES: list[tuple[tuple[str, ...], str, float]] = [
+    (("请假", "申请", "生成", "提交"), "task_execution", 0.90),
+    (("报销", "制度", "标准", "年假", "流程", "政策", "规定"), "knowledge_query", 0.92),
+    (("费用", "预算", "超支", "统计", "各部门", "支出"), "data_analysis", 0.88),
+    (("你好", "您好", "谢谢", "再见"), "chitchat", 0.95),
+]
+
+
+def _intent_payload(question: str, *, marker_text: str) -> dict:
+    """假装分类。
+
+    ⚠️ 两个入参必须分开，这是个真踩过的坑：
+      · 分类只能看**用户这句话**（question）；
+      · 触发标记要在**整个对话**（marker_text）里找，因为修复轮里
+        最后一条消息变成了"请只输出 JSON"，标记只存在于早期消息中。
+
+    如果偷懒拿整个对话去分类，system prompt 里的"报销""制度""请假"这些词
+    会把每一条用户输入都匹配成 knowledge_query —— 提示词自带的那套词汇
+    会压倒真正的用户意图。真实系统里同样如此：**别把提示词喂给分类器**。
+    """
+    if "[[BAD_CONFIDENCE]]" in marker_text:
+        # 故意返回百分比写法：验证客户端的"宽进严出"归一化，且不该触发修复
+        return _intent_dict("knowledge_query", 92)
+    if "[[BAD_ENUM]]" in marker_text:
+        # 故意编一个不存在的类别：客户端必须拒绝并触发修复
+        return _intent_dict("refund_request", 0.9)
+    for keywords, intent, confidence in _INTENT_RULES:
+        if any(keyword in question for keyword in keywords):
+            return _intent_dict(intent, confidence)
+    # 兜底给一个**低置信度**结果：正好用来演示"低于门槛就转为澄清"
+    return _intent_dict("out_of_scope", 0.55)
+
+
+def _intent_dict(intent: str, confidence: float) -> dict:
+    return {
+        "intent": intent,
+        "confidence": confidence,
+        "reason": f"mock 规则命中：{intent}",
+        "slots": {},
+    }
+
+
+def _completion(content: str, model: str, prompt_text: str) -> JSONResponse:
+    """统一的 OpenAI 兼容响应信封。"""
+    return JSONResponse(
+        {
+            "id": f"chatcmpl-mock-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            # token 数是**编的**（按字符粗略折算）。
+            # 阶段 08 做成本优化时，要换成更接近真实 tokenizer 的估算。
+            "usage": {
+                "prompt_tokens": max(1, len(prompt_text) // 2),
+                "completion_tokens": max(1, len(content) // 2),
+                "total_tokens": max(1, len(prompt_text) // 2) + max(1, len(content) // 2),
+            },
+        }
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
     user_text = _last_user_message(body)
     model = body.get("model", "mock-model")
-    started = time.perf_counter()
+
+    # 触发标记在**整个对话**里找，不只看最后一条 user 消息。
+    # 因为修复重试时最后一条消息是"请只输出 JSON"，只找最后一条会漏掉标记，
+    # "修复依然失败 → 耗尽"这种场景就演示不出来了。
+    full_text = " ".join(str(m.get("content", "")) for m in body.get("messages", []))
+    # 修复指令里一定带着 JSON Schema，用它识别"这是修复轮"
+    in_repair_turn = "JSON Schema" in full_text
 
     # ── 触发"慢" ──
     if match := _SLOW.search(user_text):
@@ -91,34 +172,20 @@ async def chat_completions(request: Request):
             resp.headers["Retry-After"] = "1"
             return resp
 
+    # ── 结构化输出模式：客户端要的是 JSON ──
+    if (body.get("response_format") or {}).get("type") == "json_object":
+        if "[[RAW_TEXT]]" in full_text and not in_repair_turn:
+            # 第一轮故意返回散文，验证客户端的修复路径真的会被触发；
+            # 修复轮则返回合法 JSON，验证"修复能成功"
+            return _completion("好的，我认为这句话是在询问公司制度。", model, user_text)
+        encoded = json.dumps(_intent_payload(user_text, marker_text=full_text), ensure_ascii=False)
+        return _completion(encoded, model, user_text)
+
     if "[[BADBODY]]" in user_text:
         # 200 但结构不对：验证客户端会不会把"格式漂移"讲清楚
         return JSONResponse({"unexpected": "shape"})
 
-    latency_ms = round((time.perf_counter() - started) * 1000, 1)
-    return JSONResponse(
-        {
-            "id": f"chatcmpl-mock-{int(time.time() * 1000)}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": _pick_reply(user_text)},
-                    "finish_reason": "stop",
-                }
-            ],
-            # token 数是**编的**（按字符粗略折算）。
-            # 阶段 08 做成本优化时，这里要换成更接近真实 tokenizer 的估算。
-            "usage": {
-                "prompt_tokens": max(1, len(user_text) // 2),
-                "completion_tokens": 20,
-                "total_tokens": max(1, len(user_text) // 2) + 20,
-            },
-            "mock_latency_ms": latency_ms,
-        }
-    )
+    return _completion(_pick_reply(user_text), model, user_text)
 
 
 def _error(status: int, message: str, model: str) -> JSONResponse:

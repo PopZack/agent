@@ -9,9 +9,12 @@
 """
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.deps import close_llm_client
 from app.api.errors import register_exception_handlers
 from app.api.middleware import RequestContextMiddleware
 from app.api.routers import chat, health
@@ -19,6 +22,21 @@ from app.core.config import get_settings
 from app.core.logging import setup_logging
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """启动 / 关闭钩子。
+
+    为什么 app_started 要挪到这里、而不是留在 create_app 末尾：
+    create_app() 只是"把应用拼装出来"，测试里会被反复调用；
+    真正"开始服务"是 lifespan 的 startup 阶段。
+    日志写在拼装点，就会出现"测试跑一次就打一行 app_started"的噪音。
+    """
+    logger.info("app_started", extra={"event": "app_started"})
+    yield
+    await close_llm_client()
+    logger.info("app_stopped", extra={"event": "app_stopped"})
 
 
 def create_app() -> FastAPI:
@@ -34,7 +52,8 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
-        description="企业智能Agent助手 —— 阶段 01：可接收问题、返回 JSON、记录请求日志的后端服务",
+        description="企业智能Agent助手 —— 阶段 02b-1：意图识别与结构化输出",
+        lifespan=_lifespan,
     )
 
     # 顺序说明：add_middleware 是"后加的在更外层"，这里只有一个中间件，不涉及顺序问题。
@@ -46,10 +65,6 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(chat.router)
 
-    logger.info(
-        "app_started",
-        extra={"event": "app_started", "session_id": None},
-    )
     return app
 
 

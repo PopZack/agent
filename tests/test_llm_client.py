@@ -16,47 +16,9 @@ import logging
 import httpx
 import pytest
 
-from app.core.config import Settings
 from app.core.exceptions import UpstreamError
-from app.llm.client import ChatMessage, LLMClient
-
-
-def make_settings(**overrides) -> Settings:
-    base = {
-        "llm_base_url": "http://mock.local/v1",
-        "llm_api_key": "test-key",
-        "llm_model": "mock-model",
-        "llm_temperature": 0.0,
-        "llm_timeout_seconds": 2.0,
-        "llm_max_retries": 3,
-        # 退避压到毫秒级：测试不该真的睡几秒，否则一套测试跑下来要几分钟
-        "llm_retry_base_seconds": 0.001,
-        "llm_retry_max_seconds": 0.01,
-    }
-    base.update(overrides)
-    return Settings(**base)
-
-
-def ok_body(content: str = "好的", *, prompt_tokens: int = 11, completion_tokens: int = 22) -> dict:
-    return {
-        "model": "mock-model",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
-    }
-
-
-def make_client(handler, **overrides) -> LLMClient:
-    return LLMClient(make_settings(**overrides), transport=httpx.MockTransport(handler))
+from app.llm.client import ChatMessage
+from tests.fakes import make_client, ok_body
 
 
 # ── 1. 正常路径：请求长什么样、响应怎么解析 ────────────────

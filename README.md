@@ -61,7 +61,26 @@ LLMClient.chat()
 配套的 `scripts/mock_llm_server.py` 是一个模拟模型服务，能按指令返回 429 / 401 /
 畸形响应 —— 重试、超时这类机制**不在真跑一遍的情况下无法验证**。
 
-02b 待做：意图识别（结构化输出）+ Function Calling + 流式 SSE。
+### 阶段 02b-1 · 意图识别与结构化输出 ✅
+
+交付标准：*模型输出能被程序可靠消费，且模型"不听话"时不会拖垮链路*
+
+```
+POST /chat
+  │
+  ├─ ChatService.answer()                    业务层：不知道 HTTP 存在
+  │    └─ IntentService.classify()           一次结构化模型调用
+  │         └─ LLMClient.chat_structured()
+  │              ├─ 带 response_format={"type":"json_object"}
+  │              ├─ _extract_json()          剥掉 ```json 围栏 / 散文前后缀
+  │              ├─ Pydantic 校验 IntentResult（宽进严出：92 → 0.92）
+  │              └─ 失败 → 回灌「它的输出 + 确切错误 + JSON Schema」修复
+  │                       **有界**：默认只修 1 次，再不行对外就是 502
+  │
+  └─ 置信度 < 阈值(0.6) → 转为向用户澄清，而不是硬猜
+```
+
+02b-2 待做：Function Calling + 流式 SSE。
 
 ## 快速开始
 
@@ -100,7 +119,7 @@ curl -X POST http://127.0.0.1:8000/chat \
 ## 开发命令
 
 ```bash
-.venv/Scripts/python -m pytest          # 17 条测试
+.venv/Scripts/python -m pytest          # 31 条测试
 .venv/Scripts/python -m ruff check .    # lint
 .venv/Scripts/python -m ruff format .   # 格式化（已采纳，请勿手工对齐行内注释）
 
@@ -125,10 +144,15 @@ app/
 │  ├─ deps.py           依赖装配点
 │  └─ routers/          health / chat
 ├─ schemas/             对外契约（请求严、响应稳）
+│  ├─ chat.py           /chat 的出入参
+│  └─ intent.py         意图契约：枚举类别 + 置信度 + 宽进严出的归一化
 ├─ llm/                 模型接入层：原生 httpx，超时 / 重试 / 错误映射
-│  └─ client.py         chat() + 退避策略 + OpenAI 兼容协议解析
+│  ├─ client.py         chat() / chat_structured() + 退避策略 + 协议解析
+│  └─ prompts.py        提示词集中管理（带版本号，便于回归对比）
 └─ services/            业务逻辑（不许 import fastapi）
-tests/                  验收测试 —— 每条断言对应一个设计决策
+   ├─ chat_service.py   意图分流 + 质量门槛
+   └─ intent_service.py 意图识别（结构化输出）
+tests/                  验收测试 + fakes（假 transport / 假模型）
 scripts/                模拟模型服务 + 实跑演示（不属于 app 包，不参与打包）
 ```
 
@@ -140,7 +164,7 @@ scripts/                模拟模型服务 + 实跑演示（不属于 app 包，
 | 阶段 | 主题 | 状态 |
 |---|---|---|
 | 01 | 后端基础与项目骨架 | ✅ 已完成 |
-| 02 | LLM 应用与 Prompt Engineering | 🔄 02a 已完成，02b 待做 |
+| 02 | LLM 应用与 Prompt Engineering | 🔄 02a ✅ / 02b-1 ✅ / 02b-2 待做 |
 | 03 | 数据库与会话记忆 | ⬜ |
 | 04 | RAG 企业知识库 | ⬜ |
 | 05 | Agent 核心执行循环（ReAct / Plan-and-Execute） | ⬜ |

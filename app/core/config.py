@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     llm_retry_base_seconds: float = 0.5
     llm_retry_max_seconds: float = 8.0
 
+    # 结构化输出：让服务端尽量保证返回 JSON。
+    # 不是所有厂商都支持 response_format，不支持时会返回 400 —— 所以它是可关的开关，
+    # 而真正兜底的是"解析失败 → 有界修复"那条路径。
+    llm_use_json_mode: bool = True
+    llm_max_repairs: int = 1
+
+    # 意图置信度低于这个值就不硬猜，转为向用户澄清（对应 JD 的"质量门槛"）
+    intent_confidence_threshold: float = 0.6
+
 
 @lru_cache
 def get_settings() -> Settings:

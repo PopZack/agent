@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_chat_service
+from app.api.deps import get_chat_service, get_intent_service, get_llm_client
 from app.core.config import get_settings
 
 
@@ -24,7 +24,11 @@ def app():
     缓存必须在测试前清掉，否则测试之间会互相污染（改了 .env 却读不到新值）。
     这是 lru_cache 做单例的通用注意事项。
     """
+    # lru_cache 做单例的代价：测试之间必须显式清缓存，否则上一个测试
+    # 建出来的真客户端会被下一个测试复用，"我明明覆盖了依赖却没生效"就是这么来的
     get_settings.cache_clear()
+    get_llm_client.cache_clear()
+    get_intent_service.cache_clear()
     get_chat_service.cache_clear()
 
     from app.main import create_app

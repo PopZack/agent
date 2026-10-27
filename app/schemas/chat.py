@@ -37,10 +37,14 @@ class ChatResponse(BaseModel):
     request_id: str = Field(description="贯穿整条链路的请求标识，排查问题时用它捞日志")
     session_id: str | None = None
     answer: str
-    stage: str = Field(
-        description="当前处在哪个学习阶段——骨架期刻意暴露出来，便于看出链路走到了哪一步",
-    )
-    model: str | None = Field(
-        default=None,
-        description="实际使用的模型名；阶段 01 还没接模型，为 None",
-    )
+    stage: str = Field(description="当前处在哪个学习阶段，便于看出链路走到了哪一步")
+    model: str | None = Field(default=None, description="实际使用的模型名")
+
+    # ── 阶段 02b-1 新增（**只在末尾追加，不改已有字段**）──
+    # 这就是"响应模型要稳"的具体做法：新需求只加字段，
+    # 已经依赖这个契约的前端 / MCP Client 不会被破坏。
+    intent: str | None = Field(default=None, description="识别出的意图类别")
+    confidence: float | None = Field(default=None, description="意图置信度 0~1")
+    reason: str | None = Field(default=None, description="模型的判断依据")
+    repairs: int = Field(default=0, description="为拿到合法结构化输出额外重问了几次")
+    total_tokens: int = Field(default=0, description="本次调用消耗的 token 总量")

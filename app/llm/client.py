@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import time
@@ -20,6 +21,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings
 from app.core.exceptions import UpstreamError
@@ -63,6 +65,20 @@ class LLMResponse:
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
+
+
+@dataclass(slots=True)
+class StructuredResult:
+    """结构化调用的结果：解析好的对象 + 原始响应 + 修复次数。
+
+    为什么要暴露 repairs：它是一个**质量信号**。如果线上 repairs 频繁 > 0，
+    说明 Prompt 或 schema 有问题（模型总在猜我们的格式），
+    阶段 08 的评测会把这个指标单独拎出来看。
+    """
+
+    data: BaseModel
+    response: LLMResponse
+    repairs: int
 
 
 class LLMClient:
@@ -190,6 +206,78 @@ class LLMClient:
         # 循环必然在上面 return 或 raise，这里只是给类型检查器一个兜底
         raise UpstreamError("重试次数耗尽", details={"attempts": max_retries})
 
+    # ── 结构化输出 ──────────────────────────────────────
+    async def chat_structured(
+        self,
+        messages: Sequence[ChatMessage],
+        schema: type[BaseModel],
+        *,
+        max_repairs: int | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
+    ) -> StructuredResult:
+        """要模型返回符合 schema 的结构化结果，失败时**有界地**自我修复。
+
+        为什么修复必须有界：每次修复都是一次真实的模型调用，花时间和钱。
+        允许无限修复，就等于给了模型一个可以无限烧钱的循环 ——
+        这和 Agent 必须有 max_steps 是同一个道理（阶段 05 会再撞上它）。
+
+        为什么修复有效：不是简单重问一遍，而是把**它自己的输出**和**确切的错误**
+        一起回灌给它。只说"重试一次"，模型只会原样再错一遍。
+        """
+        repairs_limit = self._settings.llm_max_repairs if max_repairs is None else max_repairs
+        response_format = {"type": "json_object"} if self._settings.llm_use_json_mode else None
+        convo = list(messages)
+
+        for repair in range(repairs_limit + 1):
+            response = await self.chat(
+                convo,
+                model=model,
+                temperature=temperature,
+                response_format=response_format,
+            )
+            raw = _extract_json(response.content)
+            try:
+                data = schema.model_validate_json(raw)
+            except (ValidationError, ValueError) as exc:
+                last_error = _short_error(exc)
+                if repair >= repairs_limit:
+                    logger.warning(
+                        "structured_output_failed",
+                        extra={
+                            "event": "structured_output_failed",
+                            "error_code": schema.__name__,
+                            "repairs": repair,
+                            "attempt": response.attempts,
+                        },
+                    )
+                    raise UpstreamError(
+                        "模型输出无法解析为目标结构，修复次数已用尽",
+                        details={
+                            "schema": schema.__name__,
+                            "repairs": repair,
+                            "last_error": last_error,
+                            "raw": response.content[:300],
+                        },
+                    ) from exc
+                logger.warning(
+                    "structured_output_repair",
+                    extra={
+                        "event": "structured_output_repair",
+                        "error_code": schema.__name__,
+                        "repairs": repair + 1,
+                    },
+                )
+                convo = [
+                    *convo,
+                    ChatMessage("assistant", response.content),
+                    ChatMessage("user", _repair_instruction(last_error, schema)),
+                ]
+                continue
+            return StructuredResult(data=data, response=response, repairs=repair)
+
+        raise UpstreamError("结构化输出失败")  # 兜底，逻辑上走不到
+
     # ── 重试节奏 ────────────────────────────────────────
     def _retry_delay(self, attempt: int, retry_after: str | None) -> float:
         """算下次重试前等多久。
@@ -276,3 +364,59 @@ class LLMClient:
             latency_ms=round((time.perf_counter() - started) * 1000, 1),
             attempts=attempt,
         )
+
+
+# ── 结构化输出的辅助函数（模块级：它们不依赖任何实例状态，纯输入输出）──
+
+
+def _extract_json(text: str) -> str:
+    """从模型输出里抠出 JSON 本体。
+
+    模型极爱把 JSON 包在 ```json 围栏里，或者前面加一句"好的，这是结果："。
+    直接 json.loads(原文) 会失败，然后你会误判成"这个模型不会输出 JSON"，
+    去换模型、改 Prompt，折腾半天 —— 其实问题只在几个字符的清洗上。
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        newline = cleaned.find("\n")
+        if newline != -1:
+            cleaned = cleaned[newline + 1 :]
+        if cleaned.rstrip().endswith("```"):
+            cleaned = cleaned.rstrip()[:-3]
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start != -1 and end > start:
+        cleaned = cleaned[start : end + 1]
+    return cleaned.strip()
+
+
+def _short_error(exc: Exception) -> str:
+    """把校验错误压成一句话。
+
+    别把整个 pydantic 错误树甩给模型：又长又绕，模型反而抓不住重点。
+    """
+    if isinstance(exc, ValidationError):
+        parts = []
+        for err in exc.errors()[:5]:
+            loc = "/".join(str(p) for p in err["loc"])
+            # pydantic 的 msg 里**不含**违规的那个值（只会说"Input should be ..."），
+            # 实际值在 err["input"] 里。不把它带上，修复指令就是在说废话 ——
+            # 模型没法知道"我到底写错成了什么"。
+            got = repr(err.get("input"))[:40]
+            parts.append(f"{loc}: {err['msg']}（实际写的是 {got}）")
+        return "; ".join(parts)
+    return str(exc)[:200]
+
+
+def _repair_instruction(last_error: str, schema: type[BaseModel]) -> str:
+    """构造修复指令。
+
+    关键点：把 **JSON Schema 本身**贴给模型。schema 是机器可读的契约，
+    贴上去比用自然语言复述一遍字段要求精确得多 —— 模型不用猜。
+    """
+    schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    return (
+        "你上一次的输出不是合法的目标 JSON，解析失败。具体错误：\n"
+        f"{last_error}\n\n"
+        "请**只输出一个 JSON 对象**，不要任何解释文字，不要 Markdown 代码围栏。\n"
+        f"它必须满足这个 JSON Schema：\n{schema_json}"
+    )
