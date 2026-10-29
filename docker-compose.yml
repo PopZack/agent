@@ -1,25 +1,27 @@
-# 本地开发环境：PostgreSQL（阶段 03）。Redis 在阶段 03b 加入。
+# 本地开发环境：MySQL 8（阶段 1 起使用）。
 # 用法：docker compose up -d
 #
-# 为什么给 PG 配 healthcheck：应用容器（以及测试）要等它**真正就绪**
-# 才能连 —— "容器启动了"不等于"能接受连接"，PG 初始化要几秒。
+# 为什么配 healthcheck：应用与测试要等 MySQL **真正就绪** 才能连，
+# "容器启动" != "可接受连接"，初始化需要几秒。
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: agent-postgres
+  mysql:
+    image: mysql:8.0
+    container_name: aegisflow-mysql
+    command: --default-authentication-plugin=mysql_native_password
     environment:
-      POSTGRES_USER: agent
-      POSTGRES_PASSWORD: agent
-      POSTGRES_DB: agent
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: aegisflow
+      MYSQL_USER: aegis
+      MYSQL_PASSWORD: aegis
     ports:
-      - "5432:5432"
+      - "3306:3306"
     volumes:
-      - agent-pgdata:/var/lib/postgresql/data
+      - aegisflow-mysqldata:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U agent -d agent"]
-      interval: 3s
-      timeout: 3s
-      retries: 15
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -proot --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
 volumes:
-  agent-pgdata:
+  aegisflow-mysqldata:

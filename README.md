@@ -1,226 +1,252 @@
-# Enterprise Agent · 企业智能Agent助手
+# AegisFlow
 
-从零实现一个 **Agent Harness / Runtime** 的学习项目。目标不是"跑通一个 Demo"，
-而是把每一层为什么这么设计讲清楚、写出来、测出来。
+**企业级 AI 事件调查与自动处置平台 —— 从 0 到 1 的受控 Agent 工程**
 
-> 硬约束：**只用模拟数据、模拟审批接口，不接任何真实企业系统。**
+AegisFlow 面向企业业务异常（订单支付失败、Webhook 投递失败、第三方 API 超时、订单与履约状态不一致）。
+用户创建事件后，系统通过 LangGraph 编排调查流程，让 Agent 使用**受控工具**收集业务证据、检索排障知识、
+分析可能原因、生成处置计划；涉及**有副作用**的操作时暂停等待人工审批，批准后执行**模拟**动作，再独立查询验证，最终生成可追溯报告。
 
-## 这是什么
+> 核心原则：**模型可以提出"要做什么"，但不能单独决定"是否有权做、是否允许做、是否已经做过、做完是否成功"。**
+> 这些判断由确定性的代码、业务状态与权限策略执行。
 
-模拟企业内部智能助手：能查公司制度、分析业务数据、调用业务工具，
-并执行**有权限限制的多步骤任务**。所有涉及真实修改数据的操作，
-都必须先过权限检查 + 人工确认。
+本项目是学习 / 作品集级工程：**只用模拟数据、模拟审批与模拟写操作，不连接任何真实支付、客户生产数据或外部消息系统。**
 
-## 目标架构（7 层）
+---
 
-```
-用户交互层      聊天界面 / 会话管理 / 流式响应 / 任务状态
-     │
-Agent Harness   执行循环 / 规划 / 状态机 / 上下文压缩 / 重试 / 权限 / 日志 / 恢复
-     │
-RAG 知识库      文档解析 / Embedding / 检索 / Rerank / 引用
-     │
-工具系统        Function Calling / MCP / SQL 查询 / 业务 API
-     │
-数据层          PostgreSQL / Redis / 向量检索 / 任务状态
-     │
-安全与质量      沙箱 / 权限 / 评测 / Tracing / Token 成本
-     │
-部署与运维      Docker / 自动化测试 / CI-CD / 监控 / 故障恢复
-```
+## 它不是什么
+
+- 不是只会聊天的 Chatbot。
+- 不允许模型直接执行 SQL / Shell / 任意 Python 代码。
+- 不允许模型动态构造任意 URL 访问互联网。
+- 首版不做微服务、不做复杂多 Agent、不为"技术栈完整"强行引入 Redis / MCP / 向量数据库。
+- 不把模型生成的根因直接认定为事实。
+
+---
 
 ## 当前进度
 
-### 阶段 01 · 后端基础与项目骨架 ✅
+### ✅ 阶段 0 · 准备阶段（需求 / 环境 / 项目骨架）
 
-交付标准（来自项目规格）：*「一个可以接收问题、返回 JSON、记录请求日志的后端服务」*
+本阶段已完成，交付物：
 
-```
-POST /chat  ──→  RequestContextMiddleware （生成/沿用 request_id，写入 ContextVar）
-                     │
-                     ├─→ ChatRequest        （Pydantic 校验入参）
-                     ├─→ ChatService.answer （业务逻辑）
-                     └─→ ChatResponse       （拼装对外契约，盖 request_id）
-                     │
-                     └─→ 访问日志（自带 request_id + 耗时） + 响应头 X-Request-ID
-```
+- `pyproject.toml`（Python 3.12，依赖按阶段规划）
+- `.env.example`（真实密钥不入库）+ `.gitignore`
+- `docker-compose.yml`（本地 MySQL 8）
+- 最小可运行骨架：`GET /health` + 冒烟测试
+- 四类模拟事件 `data/seed/events.json` + 业务数据 `data/seed/business_data.json`
+- 8 份排障手册 `data/knowledge/*.md`
+- 领域模型与状态定义 `docs/DOMAIN_DESIGN.md`
+- MVP 验收清单 `docs/MVP_CHECKLIST.md`
 
-### 阶段 02a · 模型接入层 ✅
+> 阶段 0 只做"可验证的最小地基"，不实现业务 API / Agent / RAG。
 
-交付标准：*能发出模型调用、扛住限流与超时、并把上游故障讲清楚的一层*
+后续阶段见 [阶段路线图](#阶段路线图)。
 
-```
-LLMClient.chat()
-   ├─ 发请求   POST {LLM_BASE_URL}/chat/completions   （原生 httpx，不用 SDK）
-   ├─ 超时     connect 与 read 分开设上限
-   ├─ 重试     429 / 5xx / 超时 → 指数退避 + 抖动，优先听 Retry-After
-   │           401 / 403 / 404 → 一次就放弃（重试没意义，只是白烧钱）
-   └─ 解析     choices[0].message.content + usage；上游格式漂移要说清坏在哪
-```
+---
 
-配套的 `scripts/mock_llm_server.py` 是一个模拟模型服务，能按指令返回 429 / 401 /
-畸形响应 —— 重试、超时这类机制**不在真跑一遍的情况下无法验证**。
-
-### 阶段 02b-1 · 意图识别与结构化输出 ✅
-
-交付标准：*模型输出能被程序可靠消费，且模型"不听话"时不会拖垮链路*
+## 架构概览（逻辑架构）
 
 ```
-POST /chat
-  │
-  ├─ ChatService.answer()                    业务层：不知道 HTTP 存在
-  │    └─ IntentService.classify()           一次结构化模型调用
-  │         └─ LLMClient.chat_structured()
-  │              ├─ 带 response_format={"type":"json_object"}
-  │              ├─ _extract_json()          剥掉 ```json 围栏 / 散文前后缀
-  │              ├─ Pydantic 校验 IntentResult（宽进严出：92 → 0.92）
-  │              └─ 失败 → 回灌「它的输出 + 确切错误 + JSON Schema」修复
-  │                       **有界**：默认只修 1 次，再不行对外就是 502
-  │
-  └─ 置信度 < 阈值(0.6) → 转为向用户澄清，而不是硬猜
+用户 / Web 工作台
+      |
+      v
+FastAPI API  ->  Application Service  ->  Agent Harness 入口
+                                              |
+                  +---------------------------+---------------------------+
+                  |                                                       |
+                  v                                                       v
+          LangGraph 工作流                                        Harness 控制能力
+      State / Nodes / Edges                              工具注册 · 参数校验
+      条件路由 / 调查循环                                 权限与风险策略
+      人工中断 / 恢复                                     调用预算 · 超时
+                  |                                       上下文与证据管理
+                  |                                       错误与重试 · 输出验证
+                  |                                       日志 · Trace · 审计
+                  +-------------------------+-----------------------------+
+                                            |
+                                            v
+                             LLM + 受控业务工具 + RAG
+                                            |
+                                            v
+                        MySQL / Checkpointer / 本地知识库
 ```
 
-### 阶段 02b-2 · Function Calling + 流式 SSE ✅
+Harness 不是单个类，而是一组明确的职责与控制机制（Runtime、Tool Registry/Executor、Context Manager、
+Policy Engine、Budget Manager、Error Handler、Validator、Audit），与 LangGraph 协同工作。
 
-交付标准：*模型能选择并调用工具拿到真实数据；回答能以 SSE 流式吐出*
+数据库分层（不要混淆）：
+- **MySQL**：业务事实与审计（事件、审批、动作执行记录）。
+- **LangGraph Checkpointer**：图执行检查点，用于恢复工作流。
+- **本地知识库**：排障手册 / 系统说明 / 历史案例。
+- **评测集文件**：固定测试输入与标注。
 
-```
-POST /chat            非流式：意图 → 工具轮（最多 N 轮）→ 回答轮
-POST /chat/stream     流式：  同一条链路，回答轮改为 SSE 逐段吐出
-
-工具执行器四道关（模型输出是不可信输入）：
-  1 白名单   工具名不存在 → 把可用清单回传，模型下一轮才可能选对
-  2 解析     arguments 不是合法 JSON → 原文截断回传
-  3 校验     Pydantic 校验参数 → 错误里带"实际给的是什么"
-  4 超时     asyncio.timeout 包住执行 → 挂死的工具不能挂死请求
-任何一关失败都返回 ToolResult(ok=False) 讲给模型听 —— 工具失败 ≠ 请求失败。
-```
-
-**阶段 02 完结。**
-
-### 阶段 03a · 持久化地基 🔄
-
-交付标准（阶段 03 全部完成时）：*支持多用户、多会话，能保存任务状态、对话历史和操作记录*
-
-```
-docker compose up -d                  # PostgreSQL 16（带 healthcheck）
-python scripts/init_db.py             # 建表
-
-users ──< chat_sessions ──< chat_messages
-  UUID 主键（不泄露规模） · timestamptz（带时区） · 软删除（deleted_at）
-  JSONB 存工具轨迹 · (session_id, created_at) 复合索引
-
-POST /sessions            新建会话
-GET  /sessions            我的会话列表（带消息数）
-GET  /sessions/{id}/messages   会话消息（倒序取最近 N 条、正序返回）
-PATCH /sessions/{id}      重命名
-DELETE /sessions/{id}     软删除
-POST /chat                传 session_id 时自动落库（user+assistant 两条）
-                          不传则保持无会话模式，行为与阶段 01/02 一致
-身份：X-User-Name 请求头（学习项目临时方案，接口形状按有鉴权设计）
-```
-
-03b 待做：记忆进上下文（多轮指代消解）、Redis 缓存、记忆生命周期。
-
-## 快速开始
-
-```bash
-# 1. 建虚拟环境并安装（含开发依赖）
-python -m venv .venv
-.venv/Scripts/python -m pip install -e ".[dev]"     # Windows
-# source .venv/bin/activate && pip install -e ".[dev]"   # macOS / Linux
-
-# 2. 配置
-cp .env.example .env
-
-# 3. 启动（Windows 下加 PYTHONIOENCODING 避免中文日志乱码）
-PYTHONIOENCODING=utf-8 .venv/Scripts/python -m uvicorn app.main:app --reload
-```
-
-接口文档 http://127.0.0.1:8000/docs
-
-```bash
-curl -X POST http://127.0.0.1:8000/chat \
-  -H "Content-Type: application/json" \
-  -H "X-Request-ID: trace-demo-001" \
-  -d '{"message":"帮我查一下公司的差旅报销制度，并告诉我住宿标准。"}'
-```
-
-```json
-{
-  "request_id": "trace-demo-001",
-  "session_id": null,
-  "answer": "[阶段01 骨架] 已收到你的问题：帮我查一下公司的差旅报销制度，并告诉我住宿标准。",
-  "stage": "01-skeleton",
-  "model": null
-}
-```
-
-## 开发命令
-
-```bash
-.venv/Scripts/python -m pytest          # 52 条 + 7 条仓储测试（需 PG，连不上自动 skip）
-.venv/Scripts/python -m ruff check .    # lint
-.venv/Scripts/python -m ruff format .   # 格式化（已采纳，请勿手工对齐行内注释）
-
-# 模拟模型服务 + 实跑演示（学习用，不接真实模型）
-.venv/Scripts/python scripts/mock_llm_server.py    # 终端 1：默认监听 127.0.0.1:8200
-.venv/Scripts/python scripts/demo_llm_layer.py     # 终端 2：实跑正常/限流/鉴权/格式漂移
-```
+---
 
 ## 目录结构
 
+当前（阶段 0）：
+
 ```
-app/
-├─ main.py              应用入口（create_app 工厂）
-├─ core/                跨层基础设施，被所有人依赖，自己不依赖别人
-│  ├─ config.py         pydantic-settings 配置（启动即校验）
-│  ├─ context.py        request_id 的 ContextVar —— 全链路串联的地基
-│  ├─ logging.py        Filter 补 request_id / Formatter 出文本或 JSON
-│  └─ exceptions.py     与协议无关的业务异常体系
-├─ api/                 对外接口层：只做校验、装配、翻译，不写业务
-│  ├─ middleware.py     request_id 中间件 + 访问日志
-│  ├─ errors.py         异常 → HTTP 的唯一翻译点
-│  ├─ deps.py           依赖装配点
-│  └─ routers/          health / chat / sessions
-├─ schemas/             对外契约（请求严、响应稳）
-│  ├─ chat.py           /chat 的出入参
-│  └─ intent.py         意图契约：枚举类别 + 置信度 + 宽进严出的归一化
-├─ llm/                 模型接入层：原生 httpx，超时 / 重试 / 错误映射
-│  ├─ client.py         chat / chat_structured / chat_stream + SSE 解析
-│  └─ prompts.py        提示词集中管理（带版本号，便于回归对比）
-├─ db/                  数据层（阶段 03a）
-│  ├─ models.py          三张表：users / chat_sessions / chat_messages
-│  ├─ session.py         引擎与请求级会话（事务边界在装配层统一管理）
-│  └─ repository.py      仓储层：多租户隔离写在查询里，不靠调用方自觉
-├─ tools/               工具系统
-│  ├─ base.py           Tool 基类：schema 从 Pydantic 自动生成（剥 title 省 token）
-│  ├─ registry.py       注册表：重名启动即炸 + 按意图的白名单
-│  └─ business.py       模拟业务工具（部门费用 / 年假余额）
-└─ services/            业务逻辑（不许 import fastapi）
-   ├─ chat_service.py   意图分流 → 工具轮 → 回答轮（含流式）
-   ├─ intent_service.py 意图识别（结构化输出）
-   └─ tool_service.py   执行器四道关
-tests/                  验收测试 + fakes（假 transport / 假模型）
-scripts/                模拟模型服务 + 实跑演示（不属于 app 包，不参与打包）
+.
+├── app/
+│   ├── __init__.py
+│   ├── main.py                     # FastAPI 入口 + /health
+│   └── infrastructure/
+│       └── settings.py             # 集中配置（pydantic-settings）
+├── data/
+│   ├── seed/                       # 模拟事件与业务数据
+│   │   ├── events.json
+│   │   ├── business_data.json
+│   │   └── README.md
+│   ├── knowledge/                  # 8 份排障手册（Markdown + frontmatter）
+│   └── evals/                      # 评测集（阶段 9 填充）
+├── docs/
+│   ├── DOMAIN_DESIGN.md            # 事件/运行/动作状态、风险等级、模式、错误分类
+│   └── MVP_CHECKLIST.md            # 验收清单
+├── tests/
+│   └── test_health.py              # 冒烟测试
+├── .env.example
+├── docker-compose.yml              # 本地 MySQL 8
+├── pyproject.toml
+└── README.md
 ```
 
-**依赖方向只能向下：** `api → services → llm →（阶段 05 起：runtime/tools/rag/db）`，
-`core` 谁都能用、自己谁也不依赖。
+目标形态（随阶段逐步长出来，见 `AegisFlow.md` 第 3.3 节）：
+`app/api`、`app/schemas`、`app/services`、`app/agent/{harness,graph}`、`app/tools`、`app/knowledge`、
+`app/policies`、`app/models`、`app/repositories`、`app/observability`、`frontend/` 等。
 
-## 学习路线
+> 原则：职责明确后再拆分，不为符合目录图提前创建大量空模块。
 
-| 阶段 | 主题 | 状态 |
+---
+
+## 快速开始
+
+### 1. 环境
+
+- Python **3.12+**
+- （阶段 1 起）Docker，用于本地 MySQL
+
+### 2. 安装依赖
+
+PowerShell：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+```
+
+Bash / Git Bash：
+
+```bash
+python -m venv .venv
+source .venv/Scripts/activate
+pip install -e ".[dev]"
+```
+
+### 3. 配置
+
+```powershell
+Copy-Item .env.example .env
+```
+
+默认 `RUN_MODE=mock`，无需 API Key 即可运行骨架与测试。
+
+### 4. 启动数据库（阶段 1 起）
+
+```bash
+docker compose up -d
+```
+
+### 5. 运行服务
+
+```bash
+uvicorn app.main:app --reload
+```
+
+访问：
+
+- 健康检查：<http://127.0.0.1:8000/health>
+- 接口文档：<http://127.0.0.1:8000/docs>
+
+`/health` 会回显当前 `environment` 与 `run_mode`（mock / real）。
+
+### 6. 测试
+
+```bash
+pytest
+```
+
+---
+
+## 运行模式
+
+| 模式 | 含义 | 要求 |
 |---|---|---|
-| 01 | 后端基础与项目骨架 | ✅ 已完成 |
-| 02 | LLM 应用与 Prompt Engineering | ✅ 02a / 02b-1 / 02b-2 |
-| 03 | 数据库与会话记忆 | 🔄 03a 已完成（待真库验证） / 03b 待做 |
-| 04 | RAG 企业知识库 | ⬜ |
-| 05 | Agent 核心执行循环（ReAct / Plan-and-Execute） | ⬜ |
-| 06 | MCP 与业务工具生态 | ⬜ |
-| 07 | Agent Harness 工程化（Skills/Hooks/Subagents/Rules） | ⬜ |
-| 08 | 评测、可观测性与成本优化 | ⬜ |
-| 09 | Docker 与生产部署 | ⬜ |
-| 10 | 综合项目与面试准备 | ⬜ |
+| `real` | 调用真实模型执行分类、工具选择、原因分析、报告生成 | 配置 `LLM_*` |
+| `mock` | 确定性模拟响应，验证图路径、审批、错误与恢复 | 无需 API Key / 网络 |
 
-每阶段都在上一阶段代码上迭代，不重写 Demo。
+Mock 模式不得伪装成真实模型结果；界面与日志都标记当前模式。没有 API Key 时，单元/集成测试与确定性演示仍可运行。
+
+---
+
+## 数据与知识
+
+- 事件与业务数据：`data/seed/`（格式见 `data/seed/README.md`）。
+- 排障手册：`data/knowledge/`（统一 frontmatter：`id`/`title`/`tags`/`source`/`updated_at`/`trust_level`）。
+- 评测集：`data/evals/`（阶段 9 填充）。
+
+四类事件与示例故事：
+
+| 事件编号 | 类型 | 故事 |
+|---|---|---|
+| `EVT-2026-001` | 订单与履约状态不一致 | 订单 `ORD-1008` 已支付，但履约未启动（同步事件失败） |
+| `EVT-2026-002` | 订单支付失败 | `ORD-1009` 网关超时后放弃 |
+| `EVT-2026-003` | Webhook 投递失败 | `ORD-1010` 支付成功回调重试耗尽 |
+| `EVT-2026-004` | 第三方 API 超时 | 风控 `fraud-check-api` 连续超时 |
+
+---
+
+## 阶段路线图
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 0 | 准备：需求 / 环境 / 项目骨架 | ✅ |
+| 1 | 普通后端骨架（FastAPI + MySQL + CRUD + 测试） | ⏳ |
+| 2 | 工具层与 Harness 最小内核（Registry/Executor/Policy/Budget/Audit） | ⏳ |
+| 3 | LangGraph 最小调查流程 + Checkpointer | ⏳ |
+| 4 | 真实模型与结构化 Tool Calling | ⏳ |
+| 5 | RAG 与证据链 | ⏳ |
+| 6 | Harness 完整控制能力（Context/Policy/Budget/Error/Validator） | ⏳ |
+| 7 | 处置计划、人工审批、中断与恢复、幂等写操作 | ⏳ |
+| 8 | 事件工作台与报告 | ⏳ |
+| 9 | 自动化测试、Agent/RAG 评测、安全验证、可观测性 | ⏳ |
+| 10 | 作品集交付 | ⏳ |
+
+---
+
+## 三条验收路径（MVP 终态）
+
+1. **成功路径**：创建事件 → 调查 → 证据 → 处置计划 → 审批 → 执行 → 验证 → 报告。
+2. **拒绝路径**：调查完成 → 需要审批 → 审批拒绝 → 不执行写操作 → 保存拒绝记录。
+3. **异常恢复路径**：工具失败 / 工作流中断 → 保存状态 → 恢复运行 → 不重复执行已成功的副作用。
+
+详见 `docs/MVP_CHECKLIST.md`。
+
+---
+
+## 关于本仓库历史
+
+本仓库此前是一个不同方向的项目（"企业智能 Agent 助手"聊天应用）。按新方案 `AegisFlow.md` **重做**为
+AegisFlow。旧代码保留在两处：
+
+- 旧版工作副本：本地 `legacy_prev_project/`（已加入 `.gitignore`，仅本地保留）。
+- 历史提交：`git log` / `git show 1194f66` 仍可追溯。
+
+---
+
+## 已知限制
+
+- 阶段 0 仅骨架：只有一个健康检查接口，无业务 API / Agent / RAG。
+- 所有处置均为**模拟**动作；`R3`（真实退款、删除生产数据、发真实消息）不提供执行工具。
+- MySQL 驱动、LangGraph 等依赖已列入 `pyproject.toml`，但阶段 0 尚未接入。

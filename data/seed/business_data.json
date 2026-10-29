@@ -1,0 +1,40 @@
+{
+  "orders": [
+    {"id": "ORD-1008", "customer_id": "CUST-3021", "status": "PAID", "amount": 2599.00, "currency": "CNY", "created_at": "2026-10-20T09:10:00+08:00", "paid_at": "2026-10-20T09:12:00+08:00", "fulfillment_id": "FUL-5001"},
+    {"id": "ORD-1009", "customer_id": "CUST-3022", "status": "PAYMENT_FAILED", "amount": 399.00, "currency": "CNY", "created_at": "2026-10-21T14:00:00+08:00", "paid_at": null, "fulfillment_id": null},
+    {"id": "ORD-1010", "customer_id": "CUST-3023", "status": "PAID", "amount": 1280.00, "currency": "CNY", "created_at": "2026-10-22T11:30:00+08:00", "paid_at": "2026-10-22T11:32:00+08:00", "fulfillment_id": "FUL-5003"},
+    {"id": "ORD-1011", "customer_id": "CUST-3024", "status": "PENDING_REVIEW", "amount": 880.00, "currency": "CNY", "created_at": "2026-10-23T20:10:00+08:00", "paid_at": null, "fulfillment_id": null}
+  ],
+  "payments": [
+    {"id": "PAY-90001", "order_id": "ORD-1008", "status": "SUCCEEDED", "gateway": "mockpay", "amount": 2599.00, "currency": "CNY", "failure_code": null, "failure_reason": null, "created_at": "2026-10-20T09:12:00+08:00", "updated_at": "2026-10-20T09:12:05+08:00"},
+    {"id": "PAY-90002", "order_id": "ORD-1009", "status": "FAILED", "gateway": "mockpay", "amount": 399.00, "currency": "CNY", "failure_code": "GATEWAY_TIMEOUT", "failure_reason": "支付网关响应超时，重试 3 次后放弃", "created_at": "2026-10-21T14:02:00+08:00", "updated_at": "2026-10-21T14:04:30+08:00"},
+    {"id": "PAY-90003", "order_id": "ORD-1010", "status": "SUCCEEDED", "gateway": "mockpay", "amount": 1280.00, "currency": "CNY", "failure_code": null, "failure_reason": null, "created_at": "2026-10-22T11:32:00+08:00", "updated_at": "2026-10-22T11:32:06+08:00"}
+  ],
+  "payment_sync_events": [
+    {"id": "SYNC-6001", "payment_id": "PAY-90001", "order_id": "ORD-1008", "type": "PAYMENT_SUCCEEDED", "status": "FAILED", "emitted_at": "2026-10-20T09:12:06+08:00", "consumed_at": null, "error": "consumer handler returned 500"},
+    {"id": "SYNC-6002", "payment_id": "PAY-90003", "order_id": "ORD-1010", "type": "PAYMENT_SUCCEEDED", "status": "CONSUMED", "emitted_at": "2026-10-22T11:32:07+08:00", "consumed_at": "2026-10-22T11:32:09+08:00", "error": null}
+  ],
+  "fulfillment_records": [
+    {"id": "FUL-5001", "order_id": "ORD-1008", "status": "NOT_STARTED", "workflow_id": "wf-ful-01", "started_at": null, "last_event_at": "2026-10-20T09:13:00+08:00"},
+    {"id": "FUL-5003", "order_id": "ORD-1010", "status": "IN_PROGRESS", "workflow_id": "wf-ful-03", "started_at": "2026-10-22T11:32:20+08:00", "last_event_at": "2026-10-22T11:40:00+08:00"}
+  ],
+  "webhook_subscriptions": [
+    {"id": "WHK-2001", "event_type": "PAYMENT_SUCCEEDED", "endpoint": "https://merchant.example.com/hooks/pay", "status": "ACTIVE"}
+  ],
+  "webhook_deliveries": [
+    {"id": "DEL-7001", "subscription_id": "WHK-2001", "event_id": "SYNC-6002", "order_id": "ORD-1010", "attempt": 1, "http_status": 500, "status": "FAILED", "error": "upstream 500", "created_at": "2026-10-22T11:32:10+08:00"},
+    {"id": "DEL-7002", "subscription_id": "WHK-2001", "event_id": "SYNC-6002", "order_id": "ORD-1010", "attempt": 2, "http_status": 500, "status": "FAILED", "error": "upstream 500", "created_at": "2026-10-22T11:37:10+08:00"},
+    {"id": "DEL-7003", "subscription_id": "WHK-2001", "event_id": "SYNC-6002", "order_id": "ORD-1010", "attempt": 3, "http_status": null, "status": "EXHAUSTED", "error": "retries exhausted", "created_at": "2026-10-22T11:42:10+08:00"}
+  ],
+  "service_statuses": [
+    {"name": "fraud-check-api", "status": "DEGRADED", "latency_p95_ms": 4200, "error_rate": 0.37, "checked_at": "2026-10-23T20:12:00+08:00"},
+    {"name": "fulfillment-service", "status": "HEALTHY", "latency_p95_ms": 180, "error_rate": 0.01, "checked_at": "2026-10-20T09:20:00+08:00"},
+    {"name": "payment-gateway", "status": "HEALTHY", "latency_p95_ms": 210, "error_rate": 0.02, "checked_at": "2026-10-21T14:06:00+08:00"}
+  ],
+  "service_logs": [
+    {"id": "LOG-8001", "service": "fulfillment-service", "level": "ERROR", "message": "no fulfillment job found for order ORD-1008; payment sync event SYNC-6001 failed", "trace_id": "tr-1008a", "timestamp": "2026-10-20T09:13:05+08:00"},
+    {"id": "LOG-8002", "service": "payment-gateway", "level": "WARN", "message": "payment request PAY-90002 timed out after 3000ms (attempt 3/3)", "trace_id": "tr-1009b", "timestamp": "2026-10-21T14:04:20+08:00"},
+    {"id": "LOG-8003", "service": "webhook-dispatcher", "level": "ERROR", "message": "delivery DEL-7003 exhausted retries for subscription WHK-2001 (last http 500)", "trace_id": "tr-1010c", "timestamp": "2026-10-22T11:42:12+08:00"},
+    {"id": "LOG-8004", "service": "fraud-check-api", "level": "ERROR", "message": "upstream call to risk-engine timed out after 4000ms", "trace_id": "tr-9f2c7a", "timestamp": "2026-10-23T20:14:50+08:00"}
+  ]
+}
